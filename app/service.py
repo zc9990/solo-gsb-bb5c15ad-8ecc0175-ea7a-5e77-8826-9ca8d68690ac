@@ -34,6 +34,15 @@
 3. 无冲突 -> 同一事务内把源命名空间的 display_names 与 name_reservations
    整体 UPDATE 到目标并返回迁移数量；唯一约束 / 锁竞争等并发异常同样
    整体回滚，由调用方重新检测后返回 409
+
+原子改名（rename_name）：
+1. BEGIN IMMEDIATE 单事务内按序校验：记录存在且属于该命名空间（否则
+   NameNotFoundError -> 404）、revision 与 expected_revision 一致（否则
+   StaleRevisionError -> 409）、新名称混脚本检查（违规 ->
+   MixedScriptViolationError -> 422）、与已注册名称（排除自身）及有效
+   预占的规范名 / 同形冲突（否则 NameConflictError -> 409）
+2. 全部通过则在同一事务更新原名与规范名并 revision + 1，id 与
+   created_at 保持不变；唯一约束兜底并发，任何失败都回滚
 """
 from __future__ import annotations
 
@@ -94,6 +103,32 @@ class MergeConflictError(Exception):
     def __init__(self, conflicts: list[dict] | None = None):
         super().__init__("merge_conflict")
         self.conflicts = conflicts or []
+
+
+class NameNotFoundError(Exception):
+    """改名的目标记录不存在或不属于该命名空间（HTTP 404）。"""
+
+
+class StaleRevisionError(Exception):
+    """expected_revision 与当前 revision 不一致：乐观并发控制失败（HTTP 409）。
+
+    current_revision 为事务内读到的最新修订号，供调用方在 409 明细中返回。
+    """
+
+    def __init__(self, current_revision: int):
+        super().__init__("stale_revision")
+        self.current_revision = current_revision
+
+
+class MixedScriptViolationError(Exception):
+    """新名称混用 Latin/Cyrillic/Greek 中两种及以上脚本（HTTP 422）。
+
+    analysis 为 analyze_scripts 的结果，供调用方构造与注册一致的 422 明细。
+    """
+
+    def __init__(self, analysis: dict):
+        super().__init__("mixed_script_violation")
+        self.analysis = analysis
 
 
 def utc_now() -> datetime:
@@ -187,12 +222,14 @@ def find_conflicts(
     namespace: str,
     normalized_name: str,
     exclude_reservation_id: int | None = None,
+    exclude_name_id: int | None = None,
     now: datetime | None = None,
 ) -> list[dict]:
     """与同命名空间内已注册名称及有效预占逐条做规范名相等 / 同形判定。
 
     已注册名称冲突排在前（按 id），有效预占冲突排在后（按 id）。
     exclude_reservation_id：确认注册时排除正在确认的那条预占自身。
+    exclude_name_id：改名时排除正在修改的那条已注册记录自身。
     """
     conflicts: list[dict] = []
     rows = conn.execute(
@@ -205,6 +242,8 @@ def find_conflicts(
         (namespace,),
     ).fetchall()
     for row in rows:
+        if exclude_name_id is not None and row["id"] == exclude_name_id:
+            continue
         existing_normalized = row["normalized_name"]
         if existing_normalized == normalized_name:
             reason = REASON_NORMALIZED_MATCH
@@ -381,6 +420,74 @@ def insert_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> 
         ids,
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def rename_name(
+    conn: sqlite3.Connection,
+    namespace: str,
+    name_id: int,
+    new_name: str,
+    expected_revision: int,
+) -> dict:
+    """原子改名：单事务校验并更新，返回更新后的完整记录。
+
+    事务内校验顺序：
+    1. 记录存在且属于该命名空间，否则 NameNotFoundError -> 404
+    2. revision 与 expected_revision 一致，否则 StaleRevisionError -> 409
+    3. 新名称不触发混脚本违规，否则 MixedScriptViolationError -> 422
+    4. 与已注册名称（排除自身）及有效预占无冲突，否则 NameConflictError -> 409
+
+    全部通过后在同一事务更新原名与规范名并 revision + 1；id 与 created_at
+    保持不变。(namespace, normalized_name) 唯一约束兜底并发改名，任何失败
+    都回滚。
+    """
+    normalized_name = normalize_name(new_name)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # 持锁期间顺带惰性清理过期预占，使冲突判定只看见有效预占
+        purge_expired_reservations(conn, namespace)
+        row = conn.execute(
+            "SELECT * FROM display_names WHERE id = ?", (name_id,)
+        ).fetchone()
+        if row is None or row["namespace"] != namespace:
+            raise NameNotFoundError(name_id)
+        if row["revision"] != expected_revision:
+            raise StaleRevisionError(row["revision"])
+        script_analysis = analyze_scripts(new_name)
+        if script_analysis["mixed_script_violation"]:
+            raise MixedScriptViolationError(script_analysis)
+        conflicts = find_conflicts(
+            conn, namespace, normalized_name, exclude_name_id=name_id
+        )
+        if conflicts:
+            raise NameConflictError(normalized_name, conflicts)
+        conn.execute(
+            """
+            UPDATE display_names
+            SET original_name = ?, normalized_name = ?, revision = revision + 1
+            WHERE id = ?
+            """,
+            (new_name, normalized_name, name_id),
+        )
+        conn.commit()
+    except (
+        NameNotFoundError,
+        StaleRevisionError,
+        MixedScriptViolationError,
+        NameConflictError,
+    ):
+        # 校验失败 / 冲突：回滚无副作用
+        conn.rollback()
+        raise
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+        # 唯一约束兜底（并发改名/注册撞同规范名）/ 锁竞争：回滚按冲突处理
+        conn.rollback()
+        raise NameConflictError(str(exc)) from exc
+
+    row = conn.execute(
+        "SELECT * FROM display_names WHERE id = ?", (name_id,)
+    ).fetchone()
+    return dict(row)
 
 
 def create_reservation(

@@ -8,8 +8,11 @@ name_reservations 保存“预占后确认注册”的预占记录：token 不�
 expires_at 为 UTC 过期时刻，consumed_at 在确认注册成功后回写（NULL 表示
 尚未消费）。未过期、未消费的预占与 display_names 一样参与冲突判定。
 
-建表语句全部幂等（IF NOT EXISTS），应用启动时执行即自动完成数据库迁移，
-既有数据库无需额外迁移步骤。
+display_names.revision 是改名接口的乐观并发修订号：注册时为 1，每次改名 +1。
+
+建表语句全部幂等（IF NOT EXISTS），应用启动时执行即自动完成数据库迁移；
+revision 列通过幂等的 ALTER TABLE 为既有数据库补齐（已存在则跳过），
+老库无需额外迁移步骤。
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ CREATE TABLE IF NOT EXISTS display_names (
     namespace       TEXT NOT NULL,
     original_name   TEXT NOT NULL,
     normalized_name TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (namespace, normalized_name)
 );
@@ -48,6 +52,16 @@ CREATE INDEX IF NOT EXISTS idx_name_reservations_namespace_active
 """
 
 
+def _ensure_revision_column(conn: sqlite3.Connection) -> None:
+    """幂等列级迁移：为既有 display_names 表补齐 revision 列（既有行默认 1）。"""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(display_names)")}
+    if "revision" not in columns:
+        conn.execute(
+            "ALTER TABLE display_names "
+            "ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+        )
+
+
 def init_db(path: str | None = None) -> str:
     """建库建表（幂等），返回实际使用的数据库路径。"""
     target = path or DATABASE_PATH
@@ -56,6 +70,7 @@ def init_db(path: str | None = None) -> str:
         os.makedirs(directory, exist_ok=True)
     with sqlite3.connect(target) as conn:
         conn.executescript(SCHEMA)
+        _ensure_revision_column(conn)
     return target
 
 

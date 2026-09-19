@@ -3,6 +3,7 @@
 接口一览：
 - POST /namespaces/{namespace}/names                              注册显示名（201 / 409 / 422）
 - POST /namespaces/{namespace}/names/batch                        批量注册（201 / 409 / 422，单事务）
+- PATCH /namespaces/{namespace}/names/{id}                        原子改名（200 / 404 / 409 / 422，单事务）
 - POST /namespaces/{namespace}/reservations                       预占名称（201 / 409 / 422）
 - POST /namespaces/{namespace}/reservations/{token}/claim         确认预占并注册（201 / 404 / 409 / 410）
 - POST /namespaces/{source}/merge                                 合并命名空间（200 / 409 / 422，单事务）
@@ -16,9 +17,10 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 import sqlite3
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Path, status
 
 from . import database, service
+from .analysis import normalize_name
 from .schemas import (
     AnalysisResult,
     BatchNameRequest,
@@ -28,6 +30,7 @@ from .schemas import (
     MergeResult,
     NameRecord,
     NameRequest,
+    RenameRequest,
     ReservationRecord,
     ReservationRequest,
 )
@@ -42,13 +45,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定、Latin/Cyrillic/Greek 混脚本拦截；"
         "支持预占后确认注册（reservations / claim），未过期预占与已注册"
         "名称一样参与全部冲突判定；支持把源命名空间的名称与预占记录"
-        "整体合并到目标命名空间（merge，冲突时不修改任何数据）。"
+        "整体合并到目标命名空间（merge，冲突时不修改任何数据）；"
+        "支持对已注册名称做带修订号的原子改名（PATCH，乐观并发控制）。"
     ),
     lifespan=lifespan,
 )
@@ -189,6 +193,65 @@ def register_names_batch(
             {"index": index, **record} for index, record in enumerate(records)
         ],
     }
+
+
+@app.patch(
+    "/namespaces/{namespace}/names/{id}",
+    response_model=NameRecord,
+    responses={
+        404: {"description": "名称记录不存在，或不属于该命名空间"},
+        409: {
+            "description": "expected_revision 与当前 revision 不一致（stale_revision），"
+            "或新名称与已有名称/有效预占冲突（name_conflict）"
+        },
+        422: {"description": "新名称混用 Latin/Cyrillic/Greek 中两种及以上脚本"},
+    },
+)
+def rename_name(
+    namespace: str,
+    payload: RenameRequest,
+    conn=Depends(get_db),
+    name_id: int = Path(alias="id"),
+) -> dict:
+    """原子改名：单个 BEGIN IMMEDIATE 事务内按序校验记录归属（404）、
+    expected_revision（409 stale_revision）、新名称混脚本（422）与规范名 /
+    同形冲突（409，排除自身、仍包含有效预占）；全部通过后更新原名与规范名
+    并递增 revision，id 与 created_at 保持不变。
+    """
+    try:
+        return service.rename_name(
+            conn, namespace, name_id, payload.name, payload.expected_revision
+        )
+    except service.NameNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "name_not_found",
+                "message": "名称记录不存在，或不属于该命名空间",
+            },
+        )
+    except service.StaleRevisionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "stale_revision",
+                "message": (
+                    f"期望修订号 {payload.expected_revision} 与当前修订号 "
+                    f"{exc.current_revision} 不一致，请重新读取后重试"
+                ),
+                "expected_revision": payload.expected_revision,
+                "current_revision": exc.current_revision,
+            },
+        )
+    except service.MixedScriptViolationError as exc:
+        raise _mixed_script_error(exc.analysis)
+    except service.NameConflictError as exc:
+        # 并发下唯一约束兜底：回滚后重新查出冲突（排除自身）
+        normalized_name = normalize_name(payload.name)
+        conflicts = exc.conflicts or service.find_conflicts(
+            conn, namespace, normalized_name, exclude_name_id=name_id
+        )
+        raise _conflict_error(normalized_name, conflicts, CONFLICT_MESSAGE)
 
 
 @app.post(

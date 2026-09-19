@@ -8,11 +8,13 @@
 | 同形字符 | 与已有名称**逐条**做 Unicode confusables 判定 | 可混淆 → `409` |
 | 混脚本 | 忽略 Common / Inherited 后，同时含 Latin、Cyrillic、Greek 中两种及以上脚本 | `422`，并列出脚本及对应码点 |
 
-原名始终原样落库，规范名（`normalized_name`）一并保存；`(namespace, normalized_name)` 在数据库层有唯一约束兜底并发写入。
+原名始终原样落库，规范名（`normalized_name`）一并保存；`(namespace, normalized_name)` 在数据库层有唯一约束兜底并发写入。每条已注册记录还带 `revision` 修订号（注册时为 1，每次改名 +1），供改名接口做乐观并发控制。
 
 此外支持**预占后确认注册**：先 `POST .../reservations` 拿到不可猜测的 token 与过期时间，在 TTL（30–600 秒）内调用 `.../reservations/{token}/claim` 确认。**未过期且未消费的预占与已注册名称完全等价地参与冲突判定**（单条注册、批量注册、新预占、`check` 均会命中），确认成功后才真正写入 `display_names`；过期记录在后续写入时惰性清理。
 
 还支持**命名空间合并**：`POST /namespaces/{source}/merge` 把源命名空间的全部已注册名称与预占记录整体迁入目标命名空间。合并前在写锁事务中对**两侧**的已注册名称与有效预占做跨空间规范名 / 同形复查，任一冲突即返回 `409`（附双方记录）且不修改任何数据；无冲突则在同一事务内完成迁移并返回迁移数量。
+
+以及**原子改名**：`PATCH /namespaces/{namespace}/names/{id}` 携带 `{"name", "expected_revision"}`，在单个 `BEGIN IMMEDIATE` 事务中完成修订号校验、混脚本与规范名 / 同形冲突分析（排除自身、仍包含有效预占）后更新名称并递增 `revision`，实现乐观并发的读-改-写；`id` 与 `created_at` 保持不变。
 
 ## 快速开始（Docker，单条命令）
 
@@ -20,7 +22,7 @@
 docker compose up --build
 ```
 
-该命令完成镜像构建、依赖安装与数据库初始化（应用启动时自动建库建表，**含向预占表 `name_reservations` 的幂等迁移**，升级老版本数据库无需手动执行 SQL；SQLite 文件落在命名卷 `names-data` 中）。命名空间合并不涉及表结构变更，容器启动后即可直接使用 `POST /namespaces/{source}/merge`。
+该命令完成镜像构建、依赖安装与数据库初始化（应用启动时自动建库建表，**含向预占表 `name_reservations` 与 `display_names.revision` 列的幂等迁移**，升级老版本数据库无需手动执行 SQL；SQLite 文件落在命名卷 `names-data` 中）。命名空间合并与原子改名均不涉及额外迁移步骤，容器启动后即可直接使用 `POST /namespaces/{source}/merge` 与 `PATCH /namespaces/{namespace}/names/{id}`。
 
 - **API 地址：http://localhost:8000**
 - **交互式文档（Swagger UI）：http://localhost:8000/docs**
@@ -41,6 +43,7 @@ uvicorn app.main:app --reload --port 8000
 | --- | --- | --- |
 | `POST` | `/namespaces/{namespace}/names` | 注册显示名：`201` 成功；`409` 规范名相同或同形冲突（含有效预占）；`422` 混脚本违规 |
 | `POST` | `/namespaces/{namespace}/names/batch` | 批量注册（1–50 个）：全部通过才在**单个事务**中落库 → `201`；任一项混脚本或与库内/有效预占/批内名称冲突 → `422` 汇总明细；并发竞争使判定失效 → 回滚重新分析 → `409` |
+| `PATCH` | `/namespaces/{namespace}/names/{id}` | **原子改名**：`{"name": ..., "expected_revision": N}`，单个 `BEGIN IMMEDIATE` 事务内校验记录归属（`404`）→ 修订号（不一致 `409` `stale_revision`）→ 混脚本（`422`）→ 规范名/同形冲突（`409`，排除自身、仍含有效预占）；成功保留 `id`/`created_at`，更新原名与规范名并 `revision + 1` → `200` |
 | `POST` | `/namespaces/{namespace}/reservations` | **预占**名称：`{"name": ..., "ttl_seconds": 30–600}` → `201` 返回不可猜测 `token` 与 `expires_at`；冲突 → `409`；混脚本 / TTL 越界 → `422` |
 | `POST` | `/namespaces/{namespace}/reservations/{token}/claim` | **确认预占**：单个 `BEGIN IMMEDIATE` 事务内校验命名空间（`404`）、有效期（过期 `410`）、消费状态（重复/并发确认 `409`）与当前冲突（`409`，不写入），通过后注册并标记已消费 → `201` |
 | `POST` | `/namespaces/{source}/merge` | **合并命名空间**：`{"target_namespace": ...}`，写锁事务内复查源与目标两侧的已注册名称与有效预占 → 有冲突 `409`（附双方记录，不改数据）；无冲突则同事务迁移并返回迁移数量 → `200`；目标与源相同 → `422` |
@@ -48,7 +51,7 @@ uvicorn app.main:app --reload --port 8000
 | `GET` | `/namespaces/{namespace}/names` | 列出命名空间内已注册名称（预占未确认前不出现在此） |
 | `GET` | `/health` | 健康检查 |
 
-单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`；合并接口为 `{"target_namespace": "<目标命名空间>"}`（1–64 字符，非空白，且不得与源相同）。
+单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`；合并接口为 `{"target_namespace": "<目标命名空间>"}`（1–64 字符，非空白，且不得与源相同）；改名接口为 `{"name": "<新显示名>", "expected_revision": <当前修订号，≥1>}`。
 
 冲突明细中的 `source` 字段区分冲突来源：`registered`（已注册名称，默认值，老客户端无需改动）或 `reservation`（有效预占，附带该预占的 `expires_at`）。
 
@@ -230,6 +233,38 @@ curl -X POST http://localhost:8000/namespaces/a/merge \
 目标命名空间与源相同（或目标为空白）→ `422`；并发写入使合并判定失效时整体回滚，
 重新检测后同样返回 `409` 及最新冲突明细。
 
+原子改名：请求体带上读取时看到的 `revision`（注册响应、列表接口均返回该字段）；
+成功保留 `id` 与 `created_at`，原名与规范名更新、`revision + 1`：
+
+```bash
+curl -X PATCH http://localhost:8000/namespaces/chat/names/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "paypal-official", "expected_revision": 1}'
+# 200 {"id":1,"namespace":"chat","original_name":"paypal-official",
+#      "normalized_name":"paypal-official","revision":2,"created_at":"..."}
+```
+
+改名的错误语义：
+
+```bash
+# 记录不存在或不属于 URL 中的命名空间 -> 404
+# 404 {"detail":{"error":"name_not_found","message":"名称记录不存在，或不属于该命名空间"}}
+
+# expected_revision 与当前 revision 不一致（期间已被他人改名）-> 409
+# 409 {"detail":{"error":"stale_revision","expected_revision":1,"current_revision":2,
+#      "message":"期望修订号 1 与当前修订号 2 不一致，请重新读取后重试"}}
+
+# 新名称混脚本 -> 422（明细与注册接口一致）
+# 422 {"detail":{"error":"mixed_script_violation","restricted_scripts_used":[...],...}}
+
+# 新名称与已有名称/有效预占冲突（排除被改记录自身）-> 409，明细与注册接口一致
+# 409 {"detail":{"error":"name_conflict","normalized_name":"paypal",
+#      "conflicts":[{"original_name":"paypal","reason":"normalized_match",...}]}}
+```
+
+仅改大小写等规范名不变的改名不会与自身冲突；改名成功后旧规范名立即释放，
+可被他人注册，新规范名同时开始占位。
+
 ## 判定规则说明
 
 1. **规范化**：`unicodedataplus.normalize("NFKC", name).casefold()`。NFKC 折叠全半角、合字等兼容字符，casefold 折叠大小写（比 lower 更彻底，如 `ß`→`ss`）。
@@ -238,6 +273,7 @@ curl -X POST http://localhost:8000/namespaces/a/merge \
 4. **批量注册**：先把整批与库内已有名称及有效预占联合分析——每项复用上述单条规则，再对批内两两做规范名相等 / 同形判定，命中时按原请求索引互相标注在双方的 `batch_conflicts` 中。任一项存在混脚本或（库内 / 预占 / 批内）冲突即整体返回 `422` 并汇总所有问题项，不写入任何记录；全部通过时在**单个 SQLite 事务**（`BEGIN IMMEDIATE`）中批量落库，事务内会复查冲突以锁定判定，并发竞争导致判定失效时整批回滚、重新分析并返回 `409` 冲突明细。
 5. **预占与确认**：预占复用规范化、混脚本与同形判定，先做只读分析，再在 `BEGIN IMMEDIATE` 事务中惰性清理过期预占并复查冲突，通过后写入 `name_reservations`（`token = secrets.token_urlsafe(32)`，不可猜测；`expires_at` 为 UTC ISO 8601）。确认时在**单个 `BEGIN IMMEDIATE` 事务**中按序校验：① token 存在且命名空间匹配（否则 `404`）→ ② `expires_at` 未过（过期则删除该记录并提交，返回 `410`）→ ③ `consumed_at IS NULL`（否则 `409`）→ ④ 复查当前冲突，排除自身预占（否则 `409`，不写入）；全部通过后写入 `display_names` 并以条件 `UPDATE ... WHERE consumed_at IS NULL` 回写消费时间，影响行数为 0 即说明并发确认抢先、整事务回滚。因此同一 token 的并发或重复确认至多一次成功。过期记录不在后台定时清理，而是在后续预占 / 注册 / 批量 / 确认事务中惰性删除。
 6. **命名空间合并**：`POST /namespaces/{source}/merge` 在**单个 `BEGIN IMMEDIATE` 写锁事务**中完成全部工作：先惰性清理两侧过期预占，再对源与目标的**已注册名称及有效预占**做跨空间规范名相等 / 同形复查（同一命名空间内部在写入时已保证互不冲突，只查跨空间组合）。任一冲突即回滚并返回 `409`，`conflicts` 中每项都带双方记录（`source_record` / `target_record`，`kind` 为 `registered` 或 `reservation`，预占附 `expires_at`），不修改任何数据；无冲突则在同一事务内把源空间的 `display_names` 与 `name_reservations`（含已消费的历史预占）整体 `UPDATE` 到目标空间，返回 `merged_names` / `merged_reservations` 两个迁移数量。并发写入导致复查或 `(namespace, normalized_name)` 唯一约束失败时整体回滚，由接口层重新检测后返回 `409`。目标与源相同 → `422`；源空间不存在或为空时合并为无操作，返回两个 `0`。
+7. **原子改名**：`PATCH /namespaces/{namespace}/names/{id}` 在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序校验：① 记录存在且属于该命名空间（否则 `404` `name_not_found`）→ ② `revision == expected_revision`（否则 `409` `stale_revision`，附当前修订号）→ ③ 新名称混脚本检查（否则 `422`，明细与注册一致）→ ④ 与已注册名称（**排除被改记录自身**）及有效预占的规范名 / 同形冲突（否则 `409` `name_conflict`，明细与注册一致）。全部通过后在同一事务更新 `original_name` / `normalized_name` 并 `revision + 1`，`id` 与 `created_at` 保持不变；`(namespace, normalized_name)` 唯一约束兜底并发改名，任何失败都回滚。客户端按“读取记录（含 `revision`）→ 带 `expected_revision` 改名 → 遇 `stale_revision` 重新读取重试”的方式实现乐观并发。
 
 ## 运行测试
 
@@ -257,7 +293,7 @@ pytest
 ```
 app/
   main.py       # FastAPI 路由与错误响应（200/201/409/422/410/404）
-  service.py    # 注册/批量/预占/确认/合并业务逻辑，逐条冲突判定与事务控制
+  service.py    # 注册/批量/改名/预占/确认/合并业务逻辑，逐条冲突判定与事务控制
   analysis.py   # NFKC+casefold 规范化、脚本与码点分析
   database.py   # SQLite 连接与建表（幂等建表即自动迁移；python -m app.database 可独立初始化）
   schemas.py    # Pydantic 请求/响应模型
@@ -268,5 +304,5 @@ requirements.txt  requirements-dev.txt
 
 ### 数据表
 
-- `display_names`：已注册名称，`(namespace, normalized_name)` 唯一约束兜底并发。
+- `display_names`：已注册名称，`(namespace, normalized_name)` 唯一约束兜底并发；`revision` 为改名接口的乐观并发修订号（注册为 1，每次改名 +1，老库启动时幂等补齐）。
 - `name_reservations`：预占记录（`token` 唯一、`expires_at`、`consumed_at`）；仅未消费且未过期的行参与冲突判定，过期行惰性物理删除。

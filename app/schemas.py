@@ -90,7 +90,20 @@ class NameRecord(BaseModel):
     namespace: str
     original_name: str
     normalized_name: str
+    # 乐观并发修订号：注册为 1，每次改名 +1（改名接口的 expected_revision 依据）
+    revision: int
     created_at: str
+
+
+class RenameRequest(BaseModel):
+    """改名请求体：新名称 + 期望的当前修订号（乐观并发控制）。"""
+
+    name: NameStr = Field(examples=["Аlice"])
+    expected_revision: int = Field(
+        ge=1,
+        examples=[1],
+        description="期望的当前修订号；与记录当前 revision 不一致时返回 409 stale_revision",
+    )
 
 
 class ReservationRecord(BaseModel):
