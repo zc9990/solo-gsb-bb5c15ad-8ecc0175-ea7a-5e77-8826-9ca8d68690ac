@@ -3,13 +3,17 @@
 数据库路径通过环境变量 DATABASE_PATH 配置，默认 ./names.db。
 表结构对 display_names (namespace, normalized_name) 做唯一约束，在数据库
 层面兜底规范名重复；同形字符（confusable）判定在应用层完成。
+revision 为乐观锁版本号：初始为 1，每次原子改名成功后递增，PATCH 改名
+接口以 expected_revision 做条件更新。
 
 name_reservations 保存“预占后确认注册”的预占记录：token 不可猜测且唯一，
 expires_at 为 UTC 过期时刻，consumed_at 在确认注册成功后回写（NULL 表示
 尚未消费）。未过期、未消费的预占与 display_names 一样参与冲突判定。
 
-建表语句全部幂等（IF NOT EXISTS），应用启动时执行即自动完成数据库迁移，
-既有数据库无需额外迁移步骤。
+建表语句全部幂等（IF NOT EXISTS），应用启动时执行即自动完成数据库迁移：
+老版本 display_names 缺少 revision 列时，会以 ALTER TABLE ... ADD COLUMN
+（默认值 1，既包含在表定义中也在迁移语句中显式给出）幂等补齐，既有数据库
+无需额外迁移步骤。
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ CREATE TABLE IF NOT EXISTS display_names (
     namespace       TEXT NOT NULL,
     original_name   TEXT NOT NULL,
     normalized_name TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (namespace, normalized_name)
 );
@@ -48,14 +53,38 @@ CREATE INDEX IF NOT EXISTS idx_name_reservations_namespace_active
 """
 
 
+# 既有数据库的列迁移：老版本 display_names 没有 revision 列。
+# ALTER TABLE ADD COLUMN 带 NOT NULL 必须给出非 NULL 默认值；以
+# "SELECT ... FROM pragma_table_info" 检查列是否存在，使迁移幂等可重入。
+MIGRATIONS = (
+    """
+    ALTER TABLE display_names
+        ADD COLUMN revision INTEGER NOT NULL DEFAULT 1
+    """,
+)
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """幂等补齐缺失列：已存在则跳过，重复执行不报错。"""
+    columns = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM pragma_table_info('display_names')")
+    }
+    if "revision" not in columns:
+        conn.execute(MIGRATIONS[0])
+
+
 def init_db(path: str | None = None) -> str:
-    """建库建表（幂等），返回实际使用的数据库路径。"""
+    """建库建表并补齐迁移列（幂等），返回实际使用的数据库路径。"""
     target = path or DATABASE_PATH
     if target != ":memory:":
         directory = os.path.dirname(os.path.abspath(target))
         os.makedirs(directory, exist_ok=True)
     with sqlite3.connect(target) as conn:
+        conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
+        _apply_migrations(conn)
+        conn.commit()
     return target
 
 

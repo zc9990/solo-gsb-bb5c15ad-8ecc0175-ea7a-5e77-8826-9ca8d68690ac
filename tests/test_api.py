@@ -951,3 +951,361 @@ def test_openapi_documents_merge_endpoint(client):
     operation = paths["/namespaces/{source}/merge"]["post"]
     assert "409" in operation["responses"]
     assert "422" in operation["responses"]
+
+
+# ---------- 原子改名 PATCH /namespaces/{namespace}/names/{id} ----------
+
+
+def rename(client, name_id, name, expected_revision, namespace="chat"):
+    return client.patch(
+        f"/namespaces/{namespace}/names/{name_id}",
+        json={"name": name, "expected_revision": expected_revision},
+    )
+
+
+def test_rename_success_updates_names_and_bumps_revision_keeps_id_and_created_at(client):
+    created = register(client, "Alice").json()
+    name_id = created["id"]
+    assert created["revision"] == 1
+
+    resp = rename(client, name_id, "Ｂｏｂ", expected_revision=1)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == name_id  # id 保留
+    assert body["namespace"] == "chat"
+    assert body["original_name"] == "Ｂｏｂ"  # 原名原样更新
+    assert body["normalized_name"] == "bob"  # 规范名重新计算
+    assert body["revision"] == 2  # revision 递增
+    assert body["created_at"] == created["created_at"]  # created_at 保留
+
+    # 再次改名：revision 继续递增，规范名查重按新名称生效
+    resp = rename(client, name_id, "Charlie", expected_revision=2)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == name_id
+    assert body["original_name"] == "Charlie"
+    assert body["normalized_name"] == "charlie"
+    assert body["revision"] == 3
+    assert body["created_at"] == created["created_at"]
+
+    # 列表接口反映改名结果（仍只有一条记录），旧规范名释放
+    names = client.get("/namespaces/chat/names").json()
+    assert len(names) == 1
+    assert names[0]["original_name"] == "Charlie"
+    assert names[0]["revision"] == 3
+    freed = register(client, "ALICE")  # 旧规范名 alice 可被重新注册
+    assert freed.status_code == 201
+    assert freed.json()["id"] != name_id
+
+
+def test_rename_to_same_name_succeeds_and_bumps_revision(client):
+    created = register(client, "Alice").json()
+
+    # 改成与当前完全相同的名称：排除自身后无冲突，允许并递增 revision
+    resp = rename(client, created["id"], "Alice", expected_revision=1)
+    assert resp.status_code == 200
+    assert resp.json()["revision"] == 2
+    assert resp.json()["normalized_name"] == "alice"
+
+
+def test_rename_stale_revision_returns_409_with_current_revision(client):
+    created = register(client, "Alice").json()
+    name_id = created["id"]
+    assert rename(client, name_id, "Alicia", expected_revision=1).status_code == 200
+
+    # 持旧版本再次改名 -> 409 stale_revision，附当前 revision
+    resp = rename(client, name_id, "Bob", expected_revision=1)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "stale_revision"
+    assert detail["current_revision"] == 2
+
+    # 改名未生效
+    assert client.get("/namespaces/chat/names").json()[0]["original_name"] == "Alicia"
+
+    # 用最新版本可成功
+    resp = rename(client, name_id, "Bob", expected_revision=2)
+    assert resp.status_code == 200
+    assert resp.json()["revision"] == 3
+
+
+def test_rename_unknown_id_returns_404(client):
+    resp = rename(client, 999, "whatever", expected_revision=1)
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "name_not_found"
+
+
+def test_rename_id_from_other_namespace_returns_404(client):
+    created = register(client, "Alice", namespace="a").json()
+
+    # id 属于命名空间 a，在 b 下改名 -> 404（只能改本空间记录）
+    resp = rename(client, created["id"], "Bob", expected_revision=1, namespace="b")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "name_not_found"
+
+    # 原空间记录未被修改
+    assert register(client, "alice", namespace="a").status_code == 409
+    names = client.get("/namespaces/a/names").json()
+    assert names[0]["original_name"] == "Alice"
+    assert names[0]["revision"] == 1
+
+
+def test_rename_normalized_conflict_returns_409_with_existing_record(client):
+    first = register(client, "Alice").json()
+    other = register(client, "Bob").json()
+
+    # 把 Bob 改成与 Alice 规范名相同 -> 409，冲突明细指向 Alice（排除自身）
+    resp = rename(client, other["id"], "ALICE", expected_revision=1)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "name_conflict"
+    assert detail["normalized_name"] == "alice"
+    assert len(detail["conflicts"]) == 1
+    conflict = detail["conflicts"][0]
+    assert conflict["id"] == first["id"]
+    assert conflict["original_name"] == "Alice"
+    assert conflict["reason"] == "normalized_match"
+    assert conflict["source"] == "registered"
+
+    # 改名未生效，revision 不递增
+    unchanged = client.get("/namespaces/chat/names").json()
+    bob = next(n for n in unchanged if n["id"] == other["id"])
+    assert bob["original_name"] == "Bob"
+    assert bob["revision"] == 1
+
+
+def test_rename_confusable_conflict_returns_409(client):
+    registered = register(client, "app").json()
+    target = register(client, "hello").json()
+
+    # 把 hello 改成纯西里尔 арр：与 app 同形但不混脚本 -> 409 confusable
+    resp = rename(client, target["id"], CYRILLIC_APP, expected_revision=1)
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["id"] == registered["id"]
+    assert conflict["reason"] == "confusable"
+    assert client.get("/namespaces/chat/names").json()[1]["original_name"] == "hello"
+
+
+def test_rename_does_not_conflict_with_itself(client):
+    created = register(client, "Alice").json()
+
+    # 仅大小写不同的新规范名与自身相等：排除自身后无冲突
+    resp = rename(client, created["id"], "ALICE", expected_revision=1)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["original_name"] == "ALICE"
+    assert body["normalized_name"] == "alice"
+    assert body["revision"] == 2
+
+
+def test_rename_active_reservation_blocks_even_when_registered_name_freed(client):
+    created = register(client, "Alice").json()
+    # 一条有效预占占用 carol
+    reservation = reserve(client, "carol", ttl_seconds=120).json()
+
+    # 改名到预占名：预占不排除 -> 409，冲突来源为 reservation
+    resp = rename(client, created["id"], "CAROL", expected_revision=1)
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["source"] == "reservation"
+    assert conflict["reason"] == "normalized_match"
+    assert conflict["id"] == reservation["id"]
+    assert conflict["expires_at"] == reservation["expires_at"]
+    assert client.get("/namespaces/chat/names").json()[0]["revision"] == 1
+
+
+def test_rename_mixed_script_returns_422_with_script_details(client):
+    created = register(client, "Alice").json()
+
+    resp = rename(client, created["id"], MIXED_ADMIN, expected_revision=1)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "mixed_script_violation"
+    assert detail["restricted_scripts_used"] == ["Cyrillic", "Latin"]
+    by_script = {d["script"]: d for d in detail["script_details"]}
+    assert by_script["Cyrillic"]["code_points"] == ["U+043C"]
+
+    # 422 不修改记录，revision 不递增
+    record = client.get("/namespaces/chat/names").json()[0]
+    assert record["original_name"] == "Alice"
+    assert record["revision"] == 1
+
+
+def test_rename_blank_name_or_non_positive_revision_rejected(client):
+    created = register(client, "Alice").json()
+    assert rename(client, created["id"], "   ", expected_revision=1).status_code == 422
+    assert rename(client, created["id"], "Bob", expected_revision=0).status_code == 422
+    # 缺少 expected_revision / name 同样 422
+    resp = client.patch(
+        f"/namespaces/chat/names/{created['id']}", json={"name": "Bob"}
+    )
+    assert resp.status_code == 422
+
+
+def test_rename_non_integer_id_returns_422(client):
+    resp = client.patch(
+        "/namespaces/chat/names/not-an-int",
+        json={"name": "Bob", "expected_revision": 1},
+    )
+    assert resp.status_code == 422
+
+
+def test_rename_concurrent_requests_exactly_one_wins(client):
+    """并发改名：版本校验串行化，恰好一次成功，其余 409 stale_revision，无 5xx。"""
+    created = register(client, "Alice").json()
+    name_id = created["id"]
+
+    def post(seq):
+        suffix = chr(ord("a") + seq)
+        return rename(client, name_id, f"name-{suffix}", expected_revision=1)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(post, range(8)))
+
+    codes = [resp.status_code for resp in responses]
+    assert codes.count(200) == 1
+    assert set(codes) <= {200, 409}
+    assert not any(code >= 500 for code in codes)
+
+    record = client.get("/namespaces/chat/names").json()[0]
+    assert record["revision"] == 2  # 只有一次改名生效
+    # 失败方拿到的 current_revision 都是 2，可用最新版本重试成功
+    stale = [resp for resp in responses if resp.status_code == 409]
+    assert all(resp.json()["detail"]["error"] == "stale_revision" for resp in stale)
+    assert all(resp.json()["detail"]["current_revision"] == 2 for resp in stale)
+
+
+def test_rename_concurrent_race_returns_409_with_current_revision(client, monkeypatch):
+    """并发竞争：改名事务开始前另一连接已抢先改名 -> 409 stale_revision，不修改。"""
+    created = register(client, "Alice").json()
+    name_id = created["id"]
+    real_rename_name = service.rename_name
+
+    def racing_rename_name(conn, namespace, target_id, name, expected_revision):
+        # 模拟并发改名：另一个连接在本事务前把 revision 提升到 2
+        other = database.get_connection()
+        try:
+            other.execute(
+                """
+                UPDATE display_names
+                   SET original_name = 'Racer', normalized_name = 'racer',
+                       revision = revision + 1
+                 WHERE id = ?
+                """,
+                (target_id,),
+            )
+            other.commit()
+        finally:
+            other.close()
+        return real_rename_name(conn, namespace, target_id, name, expected_revision)
+
+    monkeypatch.setattr(service, "rename_name", racing_rename_name)
+
+    resp = rename(client, name_id, "Bob", expected_revision=1)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "stale_revision"
+    assert detail["current_revision"] == 2
+
+    # 抢先改名生效，本次请求未覆盖
+    record = client.get("/namespaces/chat/names").json()[0]
+    assert record["original_name"] == "Racer"
+    assert record["revision"] == 2
+
+
+def test_service_rename_is_atomic_in_single_immediate_transaction(client):
+    """服务层：各失败分支都在同一事务内回滚，成功分支保留 id/created_at。"""
+    conn = database.get_connection()
+    try:
+        record = service.register_name(conn, "chat", "Alice", "alice")
+        name_id = record["id"]
+        created_at = record["created_at"]
+
+        # 预置另一条名称制造冲突
+        service.insert_name(conn, "chat", "bob", "bob")
+
+        # 版本过期
+        with pytest.raises(service.StaleRevisionError):
+            service.rename_name(conn, "chat", name_id, "x", expected_revision=99)
+        # 混脚本
+        with pytest.raises(service.MixedScriptNameError):
+            service.rename_name(conn, "chat", name_id, MIXED_ADMIN, expected_revision=1)
+        # 冲突（排除自身后与 bob 同规范名）
+        with pytest.raises(service.NameConflictError) as exc_info:
+            service.rename_name(conn, "chat", name_id, "BOB", expected_revision=1)
+        assert exc_info.value.conflicts[0]["reason"] == "normalized_match"
+        # 不存在 / 跨命名空间
+        with pytest.raises(service.NameNotFoundError):
+            service.rename_name(conn, "chat", 999, "x", expected_revision=1)
+        with pytest.raises(service.NameNotFoundError):
+            service.rename_name(conn, "other", name_id, "x", expected_revision=1)
+
+        # 全部失败后记录原样
+        rows = service.list_names(conn, "chat")
+        assert [r["original_name"] for r in rows] == ["Alice", "bob"]
+        assert rows[0]["revision"] == 1
+
+        # 成功路径
+        updated = service.rename_name(
+            conn, "chat", name_id, "Alicia", expected_revision=1
+        )
+        assert updated["id"] == name_id
+        assert updated["created_at"] == created_at
+        assert updated["original_name"] == "Alicia"
+        assert updated["normalized_name"] == "alicia"
+        assert updated["revision"] == 2
+    finally:
+        conn.close()
+
+
+def test_init_db_backfills_revision_on_legacy_database(tmp_path):
+    """启动幂等迁移：老版本 display_names 无 revision 列时自动补齐为 1。"""
+    db_path = tmp_path / "legacy.db"
+    import sqlite3
+
+    # 直接以老结构建库并写入两条记录
+    with sqlite3.connect(db_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE display_names (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace       TEXT NOT NULL,
+                original_name   TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT '',
+                UNIQUE (namespace, normalized_name)
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Alice', 'alice')"
+        )
+        legacy.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Bob', 'bob')"
+        )
+        legacy.commit()
+
+    # 启动迁移（幂等：连续执行两次）
+    database.init_db(str(db_path))
+    database.init_db(str(db_path))
+
+    with sqlite3.connect(db_path) as migrated:
+        cols = {row[1] for row in migrated.execute("PRAGMA table_info(display_names)")}
+        assert "revision" in cols
+        rows = migrated.execute(
+            "SELECT id, revision, original_name FROM display_names ORDER BY id"
+        ).fetchall()
+        assert rows == [(1, 1, "Alice"), (2, 1, "Bob")]
+
+
+def test_openapi_documents_rename_endpoint(client):
+    operation = client.get("/openapi.json").json()["paths"][
+        "/namespaces/{namespace}/names/{name_id}"
+    ]["patch"]
+    assert "200" in operation["responses"]
+    assert "404" in operation["responses"]
+    assert "409" in operation["responses"]
+    assert "422" in operation["responses"]

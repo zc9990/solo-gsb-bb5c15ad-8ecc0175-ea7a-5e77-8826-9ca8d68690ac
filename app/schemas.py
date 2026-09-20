@@ -33,6 +33,20 @@ class NameRequest(BaseModel):
     name: NameStr = Field(examples=["Аdmin"])
 
 
+class RenameRequest(BaseModel):
+    """原子改名请求体：新名称 + 调用方持有的乐观锁版本。"""
+
+    name: NameStr = Field(examples=["Аdmin"])
+    expected_revision: int = Field(
+        ge=1,
+        examples=[1],
+        description=(
+            "调用方上次读取到的 revision；与当前值一致才执行改名，"
+            "成功后 revision 递增"
+        ),
+    )
+
+
 class BatchNameRequest(BaseModel):
     """批量注册请求体：1–50 个名称，全部通过才落库。"""
 
@@ -90,6 +104,7 @@ class NameRecord(BaseModel):
     namespace: str
     original_name: str
     normalized_name: str
+    revision: int
     created_at: str
 
 
